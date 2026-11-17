@@ -1,0 +1,1040 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#05051a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>ORBIT HOP</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #05051a; overflow: hidden;
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #wrap {
+    display: flex; align-items: center; justify-content: center;
+    width: 100vw; height: 100vh; height: 100dvh;
+    transition: background-color .8s;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" aria-label="Orbit Hop game"></canvas></div>
+<script>
+'use strict';
+/* =====================================================================
+   ORBIT HOP — one-tap 8-bit planet hopper
+   Tap to launch off a spinning planet. Land on the next one.
+   Hit dead-centre for PERFECT streaks. Don't drift into the void.
+   Single file · Canvas 2D · Web Audio synth · zero image/audio assets
+   ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   1. TUNABLE CONFIG  (k = number of planets generated so far)
+   --------------------------------------------------------------------- */
+const CONFIG = {
+  W: 216, H: 384,                 // internal pixel resolution (9:16)
+  launchSpeed: 300,               // px/s flight speed
+  aimLenStart: 64, aimLenMin: 16, // aim guide shrinks as you score
+  aimShrinkPerPoint: 0.9,
+  spinStart: 1.5, spinGrowth: 0.045, spinMax: 4.3,     // rad/s
+  radiusStart: [22, 30], radiusEnd: [11, 16], radiusRampK: 45,
+  gapStart: [95, 120], gapEnd: [130, 168], gapRampK: 50,
+  randomSpinFrom: 4,              // spin direction randomises from planet k
+  movingFrom: 10,                 // drifting planets
+  moonsFrom: 20,                  // orbiting moon hazards
+  fuseFrom: 8,                    // score from which planets collapse if you wait
+  fuseStart: 4.2, fuseMin: 1.9,   // seconds before collapse
+  perfectTol: 0.28,               // landing offset (fraction of radius) for PERFECT
+  goldFrom: 4, goldChance: 0.13,  // bonus gold planets (+3 pts, +5 stars)
+  sectorEvery: 15,                // points per sector (new colours + tempo)
+};
+const { W, H } = CONFIG;
+const STEP = 1 / 60;
+const TAU = Math.PI * 2;
+
+/* ---------------------------------------------------------------------
+   2. CANVAS + RESPONSIVE SCALING
+   --------------------------------------------------------------------- */
+const wrap = document.getElementById('wrap');
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+cvs.width = W; cvs.height = H;
+ctx.imageSmoothingEnabled = false;
+function resize() {
+  const vv = window.visualViewport;
+  const vw = vv ? vv.width : innerWidth, vh = vv ? vv.height : innerHeight;
+  let s = Math.min(vw / W, vh / H);
+  if (s >= 2) s = Math.floor(s * 4) / 4;
+  cvs.style.width = Math.floor(W * s) + 'px';
+  cvs.style.height = Math.floor(H * s) + 'px';
+}
+addEventListener('resize', resize);
+window.visualViewport && visualViewport.addEventListener('resize', resize);
+resize();
+
+/* ---------------------------------------------------------------------
+   3. UTILITIES, DITHERING, NOISE
+   --------------------------------------------------------------------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const randInt = n => Math.floor(Math.random() * n);
+const pick = a => a[randInt(a.length)];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => (v + 0.5) / 16);
+const bayer = (x, y) => BAYER[(y & 3) * 4 + (x & 3)];
+const hexToRgb = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+
+function hash2(x, y, s) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(s, 982451653)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+function vnoise(x, y, s, py) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const wy = v => py ? ((v % py) + py) % py : v;
+  const a = hash2(ix, wy(iy), s), b = hash2(ix + 1, wy(iy), s);
+  const c = hash2(ix, wy(iy + 1), s), d = hash2(ix + 1, wy(iy + 1), s);
+  return lerp(lerp(a, b, sx), lerp(c, d, sx), sy);
+}
+function fbm(x, y, s, py = 0) {        // py = vertical period (lattice units) for seamless tiling
+  let v = 0, a = 0.5, f = 1, n = 0;
+  for (let o = 0; o < 4; o++) { v += a * vnoise(x * f, y * f, s + o * 17, py ? py * f : 0); n += a; a *= 0.5; f *= 2; }
+  return v / n;
+}
+
+/* ---------------------------------------------------------------------
+   4. SAVE DATA (best, stars, skins, missions) — localStorage, fail-safe
+   --------------------------------------------------------------------- */
+const SAVE_KEY = 'orbithop_v1';
+const save = Object.assign(
+  { best: 0, stars: 0, owned: [0], skin: 0, muted: false, missions: null, levels: {}, games: 0 },
+  (() => { try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; } catch { return {}; } })()
+);
+const persist = () => { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch {} };
+
+/* ---------------------------------------------------------------------
+   5. PIXEL SPRITES — characters (unlockable skins) + icons
+   --------------------------------------------------------------------- */
+function sprite(rows, map) {
+  const h = rows.length, w = rows[0].length;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ch = rows[y][x];
+    if (ch !== '.' && map[ch]) { g.fillStyle = map[ch]; g.fillRect(x, y, 1, 1); }
+  }
+  return c;
+}
+const ASTRO_ROWS = ['...wwww...', '..wwwwww..', '.wwbbbbww.', '.wbcbbbbw.', '.wbbbbbbw.', '..wwwwww..', '.wwwrrwww.', 'w.wwwwww.w', '..ww..ww..', '..kk..kk..'];
+const SKINS = [
+  { name: 'ASTRO', price: 0, trail: '#7fd6ff', rows: ASTRO_ROWS, map: { w: '#f4f4ff', b: '#2a6ad0', c: '#9ae0ff', r: '#ff4a5a', k: '#4a4a6a' } },
+  { name: 'KITTY', price: 100, trail: '#ffa040', rows: ['.o......o.', '.oo....oo.', '.oooooooo.', '.okooooko.', '.oooppooo.', '..owwwwo..', '.oddddddo.', '.oddddddo.', '..oo..oo..', '..dd..ddo.'], map: { o: '#ff9a3a', d: '#c8601a', w: '#fff4e0', k: '#1a1a2a', p: '#ff7aa8' } },
+  { name: 'ROBO', price: 200, trail: '#ff4a4a', rows: ['....yy....', '....kk....', '.kkkkkkkk.', '.kllllllk.', '.klrllrlk.', '.kllllllk.', '..kggggk..', '.gkgyygkg.', '..kggggk..', '..kk..kk..'], map: { k: '#3a3a4a', l: '#c8d0e0', r: '#ff3a3a', g: '#8a90a8', y: '#ffd84a' } },
+  { name: 'ZORP', price: 350, trail: '#6aff6a', rows: ['n........n', '.n......n.', '..nnnnnn..', '.nnnnnnnn.', 'nnkwnnkwnn', 'nnkknnkknn', '.nnnnnnnn.', '..nmmmmn..', '..n.nn.n..', '.mm....mm.'], map: { n: '#6ae04a', m: '#2a8a3a', k: '#101820', w: '#ffffff' } },
+  { name: 'DUCKO', price: 500, trail: '#ffe84a', rows: ['...yyyy...', '..yyyyyy..', '..ykyyyy..', '..yyyyoooo', '..yyyyy...', '.yyyyyyy..', 'yyywyyyyy.', 'yywwyyyyy.', '.yyyyyyy..', '..oo.oo...'], map: { y: '#ffe04a', o: '#ff8a1a', k: '#1a1a2a', w: '#fff8c0' } },
+  { name: 'SAUCER', price: 750, trail: '#4affff', rows: ['...cccc...', '..cggggc..', '..cgkkgc..', '.ssssssss.', 'ssllllllss', 'sysysysyss', '.ssssssss.', '..s....s..', '.s......s.', '..........'], map: { c: '#9affff', g: '#6ae04a', k: '#1a3a2a', s: '#7a80a0', l: '#d0d8f0', y: '#ffd84a' } },
+  { name: 'BOO', price: 1000, trail: '#d0b0ff', rows: ['...wwww...', '..wwwwww..', '.wwwwwwww.', '.wkkwwkkw.', '.wkkwwkkw.', '.wwwwwwww.', '.wwwppwww.', '.wwwwwwww.', '.wwlwwlww.', '.w..ww..w.'], map: { w: '#f0f0ff', k: '#2a1a4a', p: '#ff8ac8', l: '#b8a8e0' } },
+  { name: 'GOLDNAUT', price: 1500, trail: '#ffd84a', rows: ASTRO_ROWS, map: { w: '#ffd84a', b: '#7a3a10', c: '#fff4a0', r: '#ff4a5a', k: '#a06a10' } },
+];
+SKINS.forEach(s => (s.spr = sprite(s.rows, s.map)));
+const STAR_ICON = sprite(['...y...', '..yyy..', 'yyywyyy', '.yyyyy.', '..yyy..', '.yy.yy.', 'y.....y'], { y: '#ffd84a', w: '#ffffff' });
+const STAR_ICON_W = sprite(['...w...', '..www..', 'wwwwwww', '.wwwww.', '..www..', '.ww.ww.', 'w.....w'], { w: '#ffffff' });
+
+/* ---------------------------------------------------------------------
+   6. PROCEDURAL PIXEL PLANETS — dithered lighting, surfaces, rings
+   --------------------------------------------------------------------- */
+const STYLES = {
+  rocky:  { ramp: ['#2b1a2e', '#6b3a4a', '#b8685a', '#f2b08a'] },
+  ice:    { ramp: ['#1b2d5a', '#3a6eb0', '#86c6f0', '#effaff'] },
+  gas:    { ramp: ['#3a1f5c', '#7d3f9c', '#d073c4', '#ffc7ea'], ring: ['#8a6a4a', '#e8c890'] },
+  ocean:  { ramp: ['#0e2a4a', '#1f5a9a', '#3aa0d8', '#9be4ff'], land: ['#163a1e', '#2e7a32', '#6cc04a', '#d4f07a'] },
+  lava:   { ramp: ['#1a0a12', '#4a1a1e', '#8a2e22', '#c8502e'], hot: ['#ff7a1a', '#ffd23a'] },
+  desert: { ramp: ['#4a2a12', '#9a5a22', '#e0a050', '#ffe0a0'], ring: ['#6a4a3a', '#c8a080'] },
+  toxic:  { ramp: ['#14280e', '#3a6a12', '#8ad02a', '#e8ff8a'] },
+  gold:   { ramp: ['#5a3a00', '#b07a10', '#f0c030', '#fff4a0'] },
+  moon:   { ramp: ['#2a2a3a', '#5a5a6e', '#9a9ab0', '#e0e0f0'] },
+};
+const PLANET_TYPES = ['rocky', 'ice', 'gas', 'ocean', 'lava', 'desert', 'toxic'];
+const LIGHT = (() => { const l = [-0.55, -0.6, 0.6], m = Math.hypot(...l); return l.map(v => v / m); })();
+
+function makePlanetSprite(r, style, seed, forceRing = null) {
+  const st = STYLES[style];
+  const ring = !!st.ring && (forceRing ?? seed % 3 === 0);
+  const R2 = ring ? Math.ceil(r * 1.85) : r + 2;
+  const size = R2 * 2 + 3, c0 = (size - 1) / 2;
+  const cv = document.createElement('canvas'); cv.width = cv.height = size;
+  const g = cv.getContext('2d');
+  const img = g.createImageData(size, size), d = img.data;
+  const ramp = st.ramp.map(hexToRgb), land = st.land && st.land.map(hexToRgb);
+  const hot = st.hot && st.hot.map(hexToRgb), ringC = ring && st.ring.map(hexToRgb);
+  const put = (x, y, c, a = 255) => { const i = (y * size + x) * 4; d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2]; d[i + 3] = a; };
+  const craters = Array.from({ length: 5 }, () => ({ x: rand(-0.7, 0.7), y: rand(-0.7, 0.7), r: rand(0.12, 0.3) }));
+  const s1 = (seed * 7919) | 0;
+
+  const ringPass = front => {
+    if (!ring) return;
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+      const dx = x - c0, dy = y - c0;
+      if (front ? dy < 0 : dy >= 0) continue;
+      const e = Math.hypot(dx, dy / 0.3);
+      if (e < r * 1.35 || e > r * 1.85) continue;
+      if (Math.sin(e * 1.4) < -0.4) continue;                 // ring gaps
+      if (!front && Math.hypot(dx, dy) <= r + 0.5) continue;   // hidden behind planet
+      put(x, y, bayer(x, y) < 0.35 + (dx / (r * 2)) * 0.6 ? ringC[1] : ringC[0]);
+    }
+  };
+  ringPass(false);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const dx = x - c0, dy = y - c0, dist = Math.hypot(dx, dy);
+    const i = (y * size + x) * 4;
+    if (dist <= r + 0.5) {
+      const nx = dx / r, ny = dy / r, nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny));
+      const light = Math.max(0, nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]);
+      const n = fbm(nx * 2.3 + 50, ny * 2.3 + 50, s1);
+      let tex = n, useLand = false, isHot = false;
+      if (style === 'gas') tex = 0.5 + 0.5 * Math.sin(ny * 11 + n * 5);
+      else if (style === 'ice') tex = Math.abs(ny) > 0.6 ? 1 : 0.35 + n * 0.4;
+      else if (style === 'ocean') { useLand = n > 0.53; }
+      else if (style === 'lava') { isHot = Math.abs(n - 0.5) < 0.04; tex = n * 0.6; }
+      else if (style === 'rocky' || style === 'moon' || style === 'desert') {
+        for (const c of craters) {
+          const cd = Math.hypot(nx - c.x, ny - c.y);
+          if (cd < c.r) tex -= 0.35; else if (cd < c.r + 0.08) tex += 0.25;
+        }
+      }
+      let v = light * 0.85 + tex * 0.35 - 0.12;
+      const idx = Math.floor(clamp(v + (bayer(x, y) - 0.5) * 0.24, 0, 0.999) * 4);
+      if (isHot) put(x, y, light > 0.4 ? hot[1] : hot[0]);
+      else put(x, y, useLand ? land[idx] : ramp[idx]);
+    } else if (dist <= r + 1.7 && d[i + 3] === 0) {
+      put(x, y, ramp[2], 80);                                  // thin atmosphere halo
+    }
+  }
+  ringPass(true);
+  g.putImageData(img, 0, 0);
+  return { cv, half: c0 };
+}
+const MOON_SPR = makePlanetSprite(3, 'moon', 3);
+
+/* ---------------------------------------------------------------------
+   7. SECTORS — background gradient + seamless dithered nebula
+   --------------------------------------------------------------------- */
+const SECTORS = [
+  { name: 'DEEP SPACE',  top: '#05051a', bot: '#140c38', neb: '#3a2a8a', neb2: '#8a7ae8', accent: '#7fd6ff' },
+  { name: 'PINK NEBULA', top: '#12051e', bot: '#3a0c3a', neb: '#a0287a', neb2: '#ff7ac8', accent: '#ff7ac8' },
+  { name: 'SUPERNOVA',   top: '#1a0505', bot: '#3a1206', neb: '#c0401a', neb2: '#ffb03a', accent: '#ffb03a' },
+  { name: 'AURORA BELT', top: '#03141a', bot: '#06303a', neb: '#1aa08a', neb2: '#8affd0', accent: '#8affd0' },
+  { name: 'THE VOID',    top: '#000000', bot: '#0a0a14', neb: '#2a2a4a', neb2: '#7a7ab0', accent: '#d0d0ff' },
+  { name: 'SOLAR WINDS', top: '#1a1205', bot: '#3a2a06', neb: '#c0901a', neb2: '#fff08a', accent: '#fff08a' },
+];
+const NEB_H = 512;
+const bgCache = {}, nebCache = {};
+function bgCanvas(i) {
+  if (bgCache[i]) return bgCache[i];
+  const s = SECTORS[i], a = hexToRgb(s.top), b = hexToRgb(s.bot);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d'), img = g.createImageData(W, H), d = img.data;
+  const steps = 6;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const t = clamp(Math.floor((y / H) * steps + bayer(x, y) - 0.5) / steps, 0, 1);
+    const k = (y * W + x) * 4;
+    d[k] = lerp(a[0], b[0], t); d[k + 1] = lerp(a[1], b[1], t); d[k + 2] = lerp(a[2], b[2], t); d[k + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  return (bgCache[i] = c);
+}
+function nebCanvas(i) {
+  if (nebCache[i]) return nebCache[i];
+  const s = SECTORS[i], c1 = hexToRgb(s.neb), c2 = hexToRgb(s.neb2);
+  const c = document.createElement('canvas'); c.width = W; c.height = NEB_H;
+  const g = c.getContext('2d'), img = g.createImageData(W, NEB_H), d = img.data;
+  const sc = 64, seed = 1000 + i * 37;
+  for (let y = 0; y < NEB_H; y++) for (let x = 0; x < W; x++) {
+    const n = fbm(x / sc, y / sc, seed, NEB_H / sc);
+    const lv = (n - 0.48) * 3.2 + (bayer(x, y) - 0.5) * 0.35;
+    const k = (y * W + x) * 4;
+    if (lv > 0.95) { d[k] = c2[0]; d[k + 1] = c2[1]; d[k + 2] = c2[2]; d[k + 3] = 110; }
+    else if (lv > 0.55) { d[k] = c1[0]; d[k + 1] = c1[1]; d[k + 2] = c1[2]; d[k + 3] = 120; }
+    else if (lv > 0.25) { d[k] = c1[0]; d[k + 1] = c1[1]; d[k + 2] = c1[2]; d[k + 3] = 55; }
+  }
+  g.putImageData(img, 0, 0);
+  return (nebCache[i] = c);
+}
+const STARFIELD = [0.08, 0.2, 0.45].map((p, li) => Array.from({ length: [60, 35, 18][li] }, () => ({
+  x: randInt(W), y: rand(0, H), p, c: pick(['#ffffff', '#a8c8ff', '#ffe0b0']), tw: rand(0, TAU), big: li === 2 && Math.random() < 0.4,
+})));
+
+/* ---------------------------------------------------------------------
+   8. AUDIO — Web Audio synth SFX + chiptune loop
+   --------------------------------------------------------------------- */
+const Audio8 = {
+  ctx: null, master: null, noise: null,
+  init() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain(); this.master.gain.value = save.muted ? 0 : 0.45;
+    this.master.connect(this.ctx.destination);
+    const len = this.ctx.sampleRate;
+    this.noise = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const ch = this.noise.getChannelData(0); for (let i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+  },
+  tone(f, dur, type = 'square', vol = 0.1, slide = null, delay = 0) {
+    if (!this.ctx || save.muted) return;
+    const t = this.ctx.currentTime + delay, o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(1, slide), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master); o.start(t); o.stop(t + dur + 0.02);
+  },
+  hiss(dur, vol = 0.2, from = 4000, to = 150, delay = 0) {
+    if (!this.ctx || save.muted) return;
+    const t = this.ctx.currentTime + delay, s = this.ctx.createBufferSource(); s.buffer = this.noise;
+    const f = this.ctx.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.setValueAtTime(from, t); f.frequency.exponentialRampToValueAtTime(to, t + dur);
+    const g = this.ctx.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(t); s.stop(t + dur);
+  },
+  toggle() {
+    save.muted = !save.muted; persist();
+    if (this.master) this.master.gain.value = save.muted ? 0 : 0.45;
+    if (!save.muted) this.tone(880, 0.08);
+  },
+};
+const midi = m => 440 * Math.pow(2, (m - 69) / 12);
+const SFX = {
+  launch:   () => { Audio8.tone(220, 0.16, 'square', 0.07, 880); Audio8.hiss(0.12, 0.06, 6000, 1500); },
+  land:     () => Audio8.tone(170, 0.09, 'triangle', 0.25, 70),
+  perfect:  n => { const b = 72 + Math.min(n, 12); [0, 4, 7, 12].forEach((s, i) => Audio8.tone(midi(b + s), 0.09, 'square', 0.09, null, i * 0.045)); },
+  star:     () => { Audio8.tone(1568, 0.05, 'square', 0.06); Audio8.tone(2349, 0.09, 'square', 0.06, null, 0.04); },
+  gold:     () => [784, 988, 1175, 1568, 1976].forEach((f, i) => Audio8.tone(f, 0.08, 'square', 0.08, null, i * 0.05)),
+  fuse:     () => Audio8.tone(1046, 0.04, 'square', 0.05),
+  collapse: () => { Audio8.hiss(0.5, 0.35, 2500, 80); Audio8.tone(120, 0.5, 'sawtooth', 0.15, 40); },
+  death:    () => { Audio8.hiss(0.6, 0.35); Audio8.tone(440, 0.9, 'sawtooth', 0.18, 35); },
+  lost:     () => Audio8.tone(880, 1.0, 'triangle', 0.15, 60),
+  sector:   () => [523, 659, 784, 1047, 1319, 1568, 2093].forEach((f, i) => Audio8.tone(f, 0.12, 'triangle', 0.14, null, i * 0.06)),
+  mission:  () => [784, 784, 1047, 1319].forEach((f, i) => Audio8.tone(f, i === 3 ? 0.3 : 0.08, 'square', 0.09, null, i * 0.09)),
+  buy:      () => [1047, 1319, 1568, 2093, 2637].forEach((f, i) => Audio8.tone(f, 0.07, 'square', 0.08, null, i * 0.04)),
+  blip:     () => Audio8.tone(660, 0.05, 'square', 0.06),
+  nope:     () => Audio8.tone(150, 0.15, 'square', 0.08, 110),
+  best:     () => [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => Audio8.tone(f, 0.11, 'square', 0.09, null, 0.3 + i * 0.08)),
+};
+const Music = {
+  step: 0, timer: 0,
+  bass: [45, 45, 52, 45, 41, 41, 48, 41, 43, 43, 50, 43, 40, 40, 47, 52],
+  lead: [69, 72, 76, 79, 76, 72, 69, 64],
+  update(dt, sector, streak) {
+    if (!Audio8.ctx || save.muted) return;
+    const len = 60 / Math.min(108 + sector * 8 + Math.min(streak, 6) * 3, 172) / 2;
+    this.timer += dt;
+    while (this.timer >= len) { this.timer -= len; this.play(streak); }
+  },
+  play(streak) {
+    const s = this.step++;
+    if (s % 2 === 0) Audio8.tone(midi(this.bass[(s >> 1) % 16] - 12), 0.22, 'triangle', 0.18);
+    const off = [0, -4, -2, -5][Math.floor(s / 16) % 4];
+    Audio8.tone(midi(this.lead[s % 8] + off + (streak >= 3 ? 12 : 0)), 0.06, 'square', 0.025);
+    if (s % 4 === 2) Audio8.hiss(0.03, 0.04, 8000, 4000);
+  },
+};
+
+/* ---------------------------------------------------------------------
+   9. MISSIONS — always 3 active, escalate forever, pay out stars
+   --------------------------------------------------------------------- */
+const MT = {
+  score:   { target: l => 10 + l * 10, text: n => `SCORE ${n} IN A RUN`, run: true },
+  perfect: { target: l => 3 + l * 2,   text: n => `${n} PERFECTS IN A RUN`, run: true },
+  streak:  { target: l => 3 + l,       text: n => `PERFECT STREAK OF ${n}`, run: true },
+  stars:   { target: l => 20 + l * 20, text: n => `COLLECT ${n} STARS`, run: false },
+  games:   { target: l => 3 + l * 3,   text: n => `PLAY ${n} GAMES`, run: false },
+  movers:  { target: l => 3 + l * 3,   text: n => `LAND ON ${n} DRIFTERS`, run: false },
+  gold:    { target: l => 1 + l,       text: n => `LAND ON ${n} GOLD`, run: false },
+};
+function newMission(exclude) {
+  const types = Object.keys(MT).filter(t => !exclude.includes(t));
+  const type = pick(types), level = save.levels[type] || 0;
+  return { type, level, target: MT[type].target(level), prog: 0, reward: 15 + level * 10 };
+}
+if (!save.missions) save.missions = [];
+while (save.missions.length < 3) save.missions.push(newMission(save.missions.map(m => m.type)));
+
+const toasts = [];
+function toast(text, sub, col = '#ffd84a') { toasts.push({ text, sub, col, t: 0 }); }
+
+function missionEvent(type, value, absolute = false) {
+  save.missions.forEach((m, i) => {
+    if (m.type !== type) return;
+    m.prog = absolute ? Math.max(m.prog, value) : m.prog + value;
+    if (m.prog >= m.target) {
+      save.stars += m.reward;
+      save.levels[type] = (save.levels[type] || 0) + 1;
+      toast('MISSION COMPLETE!', `+${m.reward} STARS`);
+      SFX.mission();
+      save.missions[i] = newMission(save.missions.map(x => x.type));
+      persist();
+    }
+  });
+}
+
+/* ---------------------------------------------------------------------
+   10. GAME STATE
+   --------------------------------------------------------------------- */
+let state = 'title';           // title | play | dying | over | paused
+let clock = 0;
+let G = null;
+let titleView = save.skin;
+const titlePlanet = makePlanetSprite(34, 'gas', 3, true);
+
+function addPlanet(x, y, r, style, spin, opts = {}) {
+  const seed = randInt(100000);
+  const p = { x, baseX: x, y, r, style, spin, ang: rand(0, TAU), seed, spr: makePlanetSprite(r, style, seed),
+              moving: null, moons: [], fuse: null, fuseMax: 0, visited: false, gold: false, dead: false, ...opts };
+  G.planets.push(p);
+  return p;
+}
+
+function startRun() {
+  Audio8.init();
+  G = {
+    score: 0, starsRun: 0, perfects: 0, streak: 0, bestStreak: 0,
+    t: 0, camY: 0, planets: [], pickups: [], parts: [], texts: [], trail: [],
+    mode: 'sit', cur: null, from: null, rel: -Math.PI / 2, px: 0, py: 0, vx: 0, vy: 0, dir: 0,
+    k: 0, lastMain: null, anchorY: 0,
+    shake: 0, flash: 0, flashC: '#ffffff', hitstop: 0, timeScale: 1, dyingT: 0, overT: 0,
+    sector: 0, banner: 0, launched: false, deathReason: '', newBest: false, squash: 0, scorePop: 0, fuseBeep: 0,
+  };
+  const p0 = addPlanet(W / 2, 0, 28, 'ocean', CONFIG.spinStart * 0.85, { visited: true });
+  G.cur = G.lastMain = p0; G.anchorY = 0;
+  G.camY = p0.y - H * 0.66;
+  ensurePlanets();
+  save.missions.forEach(m => { if (MT[m.type].run) m.prog = 0; });
+  state = 'play';
+  Music.step = 0; Music.timer = 0;
+}
+
+/* ---------------------------------------------------------------------
+   11. LEVEL GENERATION — every gap is clearable; difficulty ramps with k
+   --------------------------------------------------------------------- */
+function spawnNext() {
+  const K = CONFIG, k = G.k++, last = G.lastMain;
+  const tr = Math.min(1, k / K.radiusRampK), tg = Math.min(1, k / K.gapRampK);
+  const r = Math.round(rand(lerp(K.radiusStart[0], K.radiusEnd[0], tr), lerp(K.radiusStart[1], K.radiusEnd[1], tr)));
+  const gap = rand(lerp(K.gapStart[0], K.gapEnd[0], tg), lerp(K.gapStart[1], K.gapEnd[1], tg));
+  const y = last.y - gap;
+  let x = W / 2;
+  for (let i = 0; i < 12; i++) { x = rand(r + 12, W - r - 12); if (Math.abs(x - last.baseX) > 30) break; }
+  const sign = k < K.randomSpinFrom ? 1 : (Math.random() < 0.5 ? -1 : 1);
+  const spin = sign * Math.min(K.spinMax, K.spinStart + k * K.spinGrowth);
+  const p = addPlanet(x, y, r, pick(PLANET_TYPES), spin);
+
+  if (k >= K.movingFrom && Math.random() < Math.min(0.5, 0.15 + (k - K.movingFrom) / 50)) {
+    const maxAmp = Math.min(55, x - r - 8, W - x - r - 8);
+    if (maxAmp > 12) p.moving = { amp: rand(12, maxAmp), freq: rand(0.25, 0.5), ph: rand(0, TAU) };
+  }
+  if (k >= K.moonsFrom && Math.random() < Math.min(0.45, 0.15 + (k - K.moonsFrom) / 50)) {
+    const n = k > 40 && Math.random() < 0.35 ? 2 : 1;
+    for (let i = 0; i < n; i++) p.moons.push({ a: rand(0, TAU) + i * Math.PI, dist: r + 15, spd: -Math.sign(spin) * rand(1.1, 2.0) });
+  }
+  // stars along the ideal centre-to-centre line reward perfect shots
+  const n = randInt(4);
+  for (let i = 0; i < n; i++) {
+    const t = (i + 1) / (n + 1);
+    G.pickups.push({ x: lerp(last.baseX, x, t), y: lerp(last.y, y, t), bob: rand(0, TAU) });
+  }
+  // bonus gold planet off to the side
+  if (k >= K.goldFrom && Math.random() < K.goldChance) {
+    const gy = (last.y + y) / 2 + rand(-15, 15);
+    const gx = x < W / 2 ? rand(W * 0.68, W - 18) : rand(18, W * 0.32);
+    const ok = [last, p].every(q => Math.hypot(gx - q.baseX, gy - q.y) > q.r + 10 + 26);
+    if (ok) addPlanet(gx, gy, 9, 'gold', spin * 1.2, { gold: true });
+  }
+  G.lastMain = p;
+}
+function ensurePlanets() { while (G.lastMain.y > G.camY - H * 0.6) spawnNext(); }
+
+/* ---------------------------------------------------------------------
+   12. FX
+   --------------------------------------------------------------------- */
+function burst(x, y, n, spd, cols, life = 0.6, size = 1) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), v = rand(spd * 0.25, spd);
+    G.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rand(life * 0.5, life), max: life, c: pick(cols), s: Math.random() < 0.3 ? size + 1 : size });
+  }
+  if (G.parts.length > 500) G.parts.splice(0, G.parts.length - 500);
+}
+function ring(x, y, r, col, n = 18) {
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * TAU;
+    G.parts.push({ x: x + Math.cos(a) * r, y: y + Math.sin(a) * r, vx: Math.cos(a) * 70, vy: Math.sin(a) * 70, life: 0.35, max: 0.35, c: col, s: 2 });
+  }
+}
+function floatText(t, x, y, c = '#ffffff', size = 8, life = 0.9) {
+  G.texts.push({ t, x: clamp(x, 40, W - 40), y, c, size, life, max: life });
+}
+
+/* ---------------------------------------------------------------------
+   13. CORE GAMEPLAY
+   --------------------------------------------------------------------- */
+function aimLen() { return Math.max(CONFIG.aimLenMin, CONFIG.aimLenStart - G.score * CONFIG.aimShrinkPerPoint); }
+
+function launch() {
+  if (G.mode !== 'sit') return;
+  const a = G.cur.ang + G.rel;
+  G.vx = Math.cos(a) * CONFIG.launchSpeed; G.vy = Math.sin(a) * CONFIG.launchSpeed;
+  G.mode = 'fly'; G.from = G.cur; G.anchorY = G.cur.y; G.flyT = 0; G.trail = [];
+  G.cur.fuse = null; G.launched = true;
+  burst(G.px - Math.cos(a) * 4, G.py - Math.sin(a) * 4, 8, 40, ['#ffffff', SKINS[save.skin].trail], 0.35);
+  SFX.launch();
+}
+
+function land(p) {
+  const a = Math.atan2(G.py - p.y, G.px - p.x);
+  const sp = Math.hypot(G.vx, G.vy), ux = G.vx / sp, uy = G.vy / sp;
+  const cx = p.x - G.px, cy = p.y - G.py;
+  const off = Math.abs(cx * uy - cy * ux) / p.r;           // 0 = dead-centre hit
+  G.mode = 'sit'; G.cur = p; G.rel = a - p.ang; G.squash = 0.14;
+  const ramp = STYLES[p.style].ramp;
+  burst(p.x + Math.cos(a) * p.r, p.y + Math.sin(a) * p.r, 10, 45, [ramp[2], ramp[3], '#ffffff'], 0.45);
+  navigator.vibrate && navigator.vibrate(12);
+
+  if (!p.visited) {
+    p.visited = true;
+    let pts = p.gold ? 3 : 1;
+    if (off < CONFIG.perfectTol) {
+      G.streak++; G.perfects++; G.bestStreak = Math.max(G.bestStreak, G.streak);
+      pts += G.streak;
+      floatText('PERFECT!', p.x, p.y - p.r - 26, SECTORS[G.sector % SECTORS.length].accent, 16);
+      floatText('+' + pts, p.x, p.y - p.r - 10, '#ffd84a', 8);
+      ring(G.px, G.py, 4, '#ffffff', 16);
+      G.flash = 0.08; G.flashC = '#ffffff'; G.hitstop = 0.05; G.shake = Math.min(0.25, 0.06 + G.streak * 0.02);
+      SFX.perfect(G.streak);
+      navigator.vibrate && navigator.vibrate(25);
+      missionEvent('perfect', G.perfects, true);
+      missionEvent('streak', G.streak, true);
+    } else {
+      if (G.streak >= 2) floatText('STREAK LOST', p.x, p.y - p.r - 24, '#ff6a6a', 8);
+      G.streak = 0;
+      floatText('+' + pts, p.x, p.y - p.r - 12, '#ffffff', 8);
+      SFX.land();
+    }
+    if (p.gold) {
+      SFX.gold(); save.stars += 5; G.starsRun += 5;
+      floatText('+5 STARS', p.x, p.y + p.r + 6, '#ffd84a', 8);
+      missionEvent('gold', 1); missionEvent('stars', 5);
+      burst(p.x, p.y, 24, 80, ['#ffd84a', '#fff4a0', '#ffffff'], 0.8, 1);
+    }
+    if (p.moving) missionEvent('movers', 1);
+    G.score += pts; G.scorePop = 0.15;
+    missionEvent('score', G.score, true);
+    const sec = Math.floor(G.score / CONFIG.sectorEvery);
+    if (sec > G.sector) {
+      G.sector = sec; G.banner = 2.4; SFX.sector();
+      G.flash = 0.25; G.flashC = SECTORS[sec % SECTORS.length].accent;
+    }
+  } else {
+    SFX.land();
+  }
+  // collapse timer: punishes stalling; always longer than one full rotation
+  if (G.score >= CONFIG.fuseFrom) {
+    const period = TAU / Math.abs(p.spin);
+    const t = Math.min(1, (G.score - CONFIG.fuseFrom) / 70);
+    p.fuse = p.fuseMax = Math.max(period * 1.2, lerp(CONFIG.fuseStart, CONFIG.fuseMin, t));
+  }
+}
+
+function die(reason) {
+  if (state !== 'play') return;
+  G.deathReason = reason; state = 'dying'; G.dyingT = 0; G.timeScale = 0.3; G.shake = 0.45;
+  if (reason !== 'LOST IN SPACE') {
+    burst(G.px, G.py, 40, 110, ['#ffffff', '#ffd84a', '#ff6a3a', SKINS[save.skin].trail], 0.9, 1);
+    G.flash = 0.15; G.flashC = '#ff4a4a';
+    SFX.death();
+  } else SFX.lost();
+  navigator.vibrate && navigator.vibrate(120);
+}
+
+function gameOver() {
+  state = 'over'; G.overT = 0;
+  save.games++;
+  missionEvent('games', 1);
+  if (G.score > save.best) { save.best = G.score; G.newBest = G.score > 0; if (G.newBest) SFX.best(); }
+  persist();
+}
+
+function updatePlanets(dt) {
+  for (const p of G.planets) {
+    p.ang += p.spin * dt;
+    if (p.moving) p.x = p.baseX + Math.sin(G.t * p.moving.freq * TAU + p.moving.ph) * p.moving.amp;
+    for (const m of p.moons) m.a += m.spd * dt;
+  }
+}
+
+function updatePlay(dt) {
+  G.t += dt;
+  updatePlanets(dt);
+
+  if (G.mode === 'sit') {
+    const p = G.cur, a = p.ang + G.rel;
+    G.px = p.x + Math.cos(a) * (p.r + 5); G.py = p.y + Math.sin(a) * (p.r + 5); G.dir = a;
+    if (p.fuse !== null) {
+      p.fuse -= dt;
+      if (p.fuse < 1.2) { G.fuseBeep -= dt; if (G.fuseBeep <= 0) { G.fuseBeep = 0.2; SFX.fuse(); } }
+      if (p.fuse <= 0) {
+        p.dead = true; SFX.collapse();
+        const ramp = STYLES[p.style].ramp;
+        burst(p.x, p.y, 60, 90, ramp, 1.1, 2);
+        die('PLANET COLLAPSED');
+      }
+    }
+  } else {
+    G.flyT += dt;
+    G.px += G.vx * dt; G.py += G.vy * dt;
+    G.dir = Math.atan2(G.vy, G.vx);
+    G.trail.push({ x: G.px, y: G.py }); if (G.trail.length > 14) G.trail.shift();
+    // star pickups
+    for (const s of G.pickups) {
+      if (!s.got && Math.hypot(s.x - G.px, s.y - G.py) < 10) {
+        s.got = true; save.stars++; G.starsRun++;
+        SFX.star(); burst(s.x, s.y, 8, 40, ['#ffd84a', '#ffffff'], 0.4);
+        floatText('+1', s.x, s.y - 10, '#ffd84a');
+        missionEvent('stars', 1);
+      }
+    }
+    // moon hazards
+    for (const p of G.planets) for (const m of p.moons) {
+      if (Math.hypot(p.x + Math.cos(m.a) * m.dist - G.px, p.y + Math.sin(m.a) * m.dist - G.py) < 7) { die('HIT BY A MOON'); return; }
+    }
+    // landing
+    for (const p of G.planets) {
+      if (p.dead || (p === G.from && G.flyT < 0.12)) continue;
+      if (Math.hypot(G.px - p.x, G.py - p.y) < p.r + 4) { land(p); break; }
+    }
+    if (G.mode === 'fly' && (G.px < -16 || G.px > W + 16 || G.py < G.camY - 26 || G.py > G.camY + H + 26)) die('LOST IN SPACE');
+  }
+
+  const target = (G.mode === 'sit' ? G.cur.y : G.anchorY) - H * 0.66;
+  G.camY = lerp(G.camY, target, Math.min(1, dt * 4.5));
+  ensurePlanets();
+  const bottom = G.camY + H + 90;
+  G.planets = G.planets.filter(p => p === G.cur || p.y - p.r < bottom);
+  G.pickups = G.pickups.filter(s => !s.got && s.y < bottom);
+}
+
+function updateFx(dt) {
+  for (const q of G.parts) { q.x += q.vx * dt; q.y += q.vy * dt; q.vx *= 0.94; q.vy *= 0.94; q.life -= dt; }
+  G.parts = G.parts.filter(q => q.life > 0);
+  for (const t of G.texts) { t.y -= 18 * dt; t.life -= dt; }
+  G.texts = G.texts.filter(t => t.life > 0);
+}
+
+function update(dt) {
+  clock += dt;
+  for (const t of toasts) t.t += dt;
+  if (toasts.length && toasts[0].t > 2.2) toasts.shift();
+  if (state === 'paused' || state === 'title') return;
+
+  if (state === 'play' || state === 'dying') {
+    Music.update(dt, G.sector, G.streak);
+    if (G.hitstop > 0) { G.hitstop -= dt; return; }
+    const sdt = dt * G.timeScale;
+    if (state === 'play') updatePlay(sdt);
+    else {
+      G.dyingT += dt; G.t += sdt; updatePlanets(sdt);
+      if (G.deathReason === 'LOST IN SPACE') { G.px += G.vx * sdt; G.py += G.vy * sdt; }
+      if (G.dyingT > 1.0) gameOver();
+    }
+    updateFx(sdt);
+  } else if (state === 'over') {
+    G.overT += dt; updateFx(dt);
+    if (G.newBest && Math.random() < 0.3) burst(rand(20, W - 20), -4, 1, 10, ['#ffd84a', '#ff7ac8', '#7fd6ff', '#6ae04a'], 3, 2), G.parts[G.parts.length - 1].vy = rand(40, 90);
+  }
+  G.shake = Math.max(0, G.shake - dt);
+  G.flash = Math.max(0, G.flash - dt);
+  G.scorePop = Math.max(0, G.scorePop - dt);
+  G.squash = Math.max(0, G.squash - dt);
+  G.banner = Math.max(0, G.banner - dt);
+}
+
+/* ---------------------------------------------------------------------
+   14. RENDERING
+   --------------------------------------------------------------------- */
+function txt(s, x, y, col = '#ffffff', align = 'center', size = 8, shadow = '#000000') {
+  ctx.font = `${size}px "Press Start 2P", monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'top';
+  if (shadow) { const o = size >= 16 ? 2 : 1; ctx.fillStyle = shadow; ctx.fillText(s, Math.round(x) + o, Math.round(y) + o); }
+  ctx.fillStyle = col; ctx.fillText(s, Math.round(x), Math.round(y));
+}
+function panel(x, y, w, h, fill = 'rgba(5,5,26,.82)', edge = '#ffffff') {
+  ctx.fillStyle = fill; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = edge;
+  ctx.fillRect(x + 1, y, w - 2, 1); ctx.fillRect(x + 1, y + h - 1, w - 2, 1);
+  ctx.fillRect(x, y + 1, 1, h - 2); ctx.fillRect(x + w - 1, y + 1, 1, h - 2);
+}
+
+function drawSpace(sector, camY) {
+  const si = sector % SECTORS.length;
+  ctx.drawImage(bgCanvas(si), 0, 0);
+  const neb = nebCanvas(si), off = Math.round((((-camY * 0.22) % NEB_H) + NEB_H) % NEB_H);
+  ctx.drawImage(neb, 0, off - NEB_H); ctx.drawImage(neb, 0, off);
+  for (const layer of STARFIELD) for (const s of layer) {
+    const sy = Math.round((((s.y - camY * s.p) % H) + H) % H);
+    const tw = Math.sin(clock * 3 + s.tw);
+    if (tw < -0.85) continue;
+    ctx.fillStyle = s.c; ctx.fillRect(s.x, sy, 1, 1);
+    if (s.big && tw > 0.6) { ctx.globalAlpha = 0.5; ctx.fillRect(s.x - 1, sy, 3, 1); ctx.fillRect(s.x, sy - 1, 1, 3); ctx.globalAlpha = 1; }
+  }
+}
+
+function drawPlayer(x, y, ang, sx = 1, sy = 1) {
+  ctx.save();
+  ctx.translate(Math.round(x), Math.round(y));
+  ctx.rotate(ang + Math.PI / 2);
+  ctx.scale(sx, sy);
+  ctx.drawImage(SKINS[save.skin].spr, -5, -5);
+  ctx.restore();
+}
+
+function drawPlanet(p, cam) {
+  const sy = p.y - cam;
+  if (sy < -p.r * 2 - 20 || sy > H + p.r * 2 + 20 || p.dead) return;
+  // drift track
+  if (p.moving) {
+    ctx.fillStyle = 'rgba(255,255,255,.18)';
+    for (let x = p.baseX - p.moving.amp; x <= p.baseX + p.moving.amp; x += 6) ctx.fillRect(Math.round(x), Math.round(sy), 2, 1);
+  }
+  // gold planet sparkle aura
+  if (p.gold) {
+    ctx.fillStyle = '#ffd84a';
+    for (let i = 0; i < 6; i++) {
+      const a = clock * 1.5 + (i / 6) * TAU;
+      if (Math.sin(clock * 8 + i) > 0) ctx.fillRect(Math.round(p.x + Math.cos(a) * (p.r + 6)), Math.round(sy + Math.sin(a) * (p.r + 6)), 1, 1);
+    }
+  }
+  ctx.drawImage(p.spr.cv, Math.round(p.x - p.spr.half), Math.round(sy - p.spr.half));
+  // rotating beacon lights so spin direction & speed are readable
+  const lc = STYLES[p.style].ramp[3];
+  for (let i = 0; i < 3; i++) {
+    const a = p.ang + (i / 3) * TAU;
+    ctx.fillStyle = i === 0 ? '#ffffff' : lc;
+    ctx.fillRect(Math.round(p.x + Math.cos(a) * (p.r - 2)) - 1, Math.round(sy + Math.sin(a) * (p.r - 2)) - 1, 2, 2);
+  }
+  // collapse timer ring
+  if (p.fuse !== null && p === G.cur && G.mode === 'sit') {
+    const frac = clamp(p.fuse / p.fuseMax, 0, 1), dots = 28, warn = p.fuse < 1.2;
+    for (let i = 0; i < dots; i++) {
+      const a = -Math.PI / 2 + (i / dots) * TAU;
+      const on = i / dots < frac;
+      ctx.fillStyle = on ? (warn ? (Math.floor(clock * 10) % 2 ? '#ff3a3a' : '#ffd84a') : '#ffffff') : 'rgba(255,255,255,.15)';
+      ctx.fillRect(Math.round(p.x + Math.cos(a) * (p.r + 11)), Math.round(sy + Math.sin(a) * (p.r + 11)), 1, 1);
+    }
+    if (warn) {   // planet cracks shake
+      ctx.fillStyle = '#ff3a3a';
+      for (let i = 0; i < 4; i++) ctx.fillRect(Math.round(p.x + rand(-p.r, p.r) * 0.6), Math.round(sy + rand(-p.r, p.r) * 0.6), 1, 2);
+    }
+  }
+  for (const m of p.moons) {
+    const mx = p.x + Math.cos(m.a) * m.dist, my = sy + Math.sin(m.a) * m.dist;
+    ctx.drawImage(MOON_SPR.cv, Math.round(mx - MOON_SPR.half), Math.round(my - MOON_SPR.half));
+    ctx.fillStyle = 'rgba(255,80,80,.5)';
+    ctx.fillRect(Math.round(mx), Math.round(my - 6), 1, 1);
+  }
+}
+
+function drawWorld() {
+  const cam = Math.round(G.camY);
+  for (const p of G.planets) drawPlanet(p, cam);
+  for (const s of G.pickups) {
+    const sy = s.y - cam + Math.sin(clock * 4 + s.bob) * 1.5;
+    ctx.drawImage(Math.sin(clock * 6 + s.bob) > 0.85 ? STAR_ICON_W : STAR_ICON, Math.round(s.x - 3), Math.round(sy - 3));
+  }
+  const alive = state === 'play' || G.deathReason === 'LOST IN SPACE';
+  // aim guide
+  if (state === 'play' && G.mode === 'sit') {
+    const len = aimLen(), ux = Math.cos(G.dir), uy = Math.sin(G.dir);
+    for (let d = 9; d < len; d += 5) {
+      ctx.globalAlpha = 1 - d / len;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(Math.round(G.px + ux * d), Math.round(G.py - cam + uy * d), 1, 1);
+    }
+    ctx.globalAlpha = 1;
+  }
+  // trail
+  const tc = SKINS[save.skin].trail;
+  G.trail.forEach((t, i) => {
+    ctx.globalAlpha = (i / G.trail.length) * 0.8;
+    ctx.fillStyle = i % 2 ? tc : '#ffffff';
+    const s = i > G.trail.length / 2 ? 2 : 1;
+    ctx.fillRect(Math.round(t.x) - (s >> 1), Math.round(t.y - cam) - (s >> 1), s, s);
+  });
+  ctx.globalAlpha = 1;
+  if (alive && state !== 'over') {
+    const sq = G.squash > 0 ? [1.3, 0.7] : (G.mode === 'fly' ? [0.85, 1.2] : [1, 1]);
+    drawPlayer(G.px, G.py - cam, G.dir, sq[0], sq[1]);
+  }
+  for (const q of G.parts) {
+    ctx.globalAlpha = clamp(q.life / q.max * 1.5, 0, 1);
+    ctx.fillStyle = q.c; ctx.fillRect(Math.round(q.x), Math.round(q.y - cam), q.s, q.s);
+  }
+  ctx.globalAlpha = 1;
+  for (const t of G.texts) {
+    const age = t.max - t.life;
+    const size = t.size === 16 && age < 0.1 ? 24 : t.size;   // pop-in
+    ctx.globalAlpha = clamp(t.life / t.max * 2, 0, 1);
+    txt(t.t, t.x, t.y - cam - size / 2, t.c, 'center', size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawIcons() {
+  // speaker / pause icons top-right
+  ctx.fillStyle = '#ffffff';
+  if (state === 'play') { ctx.fillRect(200, 8, 3, 10); ctx.fillRect(206, 8, 3, 10); }
+}
+function drawSpeaker(x, y) {
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(x, y + 3, 3, 4); ctx.fillRect(x + 3, y + 2, 1, 6); ctx.fillRect(x + 4, y + 1, 1, 8); ctx.fillRect(x + 5, y, 1, 10);
+  if (save.muted) { ctx.fillStyle = '#ff4a4a'; for (let i = 0; i < 6; i++) { ctx.fillRect(x + 8 + i, y + 2 + i, 1, 1); ctx.fillRect(x + 13 - i, y + 2 + i, 1, 1); } }
+  else { ctx.fillRect(x + 8, y + 3, 1, 4); ctx.fillRect(x + 10, y + 1, 1, 8); }
+}
+
+function drawHUD() {
+  const big = G.scorePop > 0 ? 32 : 24;
+  txt(String(G.score), W / 2, 12 - (big - 24) / 2, '#ffffff', 'center', big, '#1a1040');
+  ctx.drawImage(STAR_ICON, 6, 8);
+  txt(String(save.stars), 16, 8, '#ffd84a', 'left', 8);
+  drawIcons();
+  if (G.streak >= 2) {
+    const cols = ['#ff7ac8', '#ffd84a', '#7fd6ff', '#6ae04a'];
+    txt(`PERFECT x${G.streak}`, W / 2, 42, cols[Math.floor(clock * 8) % 4], 'center', 8);
+  }
+  if (!G.launched && state === 'play' && Math.floor(clock * 2.5) % 2) txt('TAP TO LAUNCH', W / 2, H - 46, '#ffffff', 'center', 8);
+  if (!G.launched && state === 'play') txt('LAND DEAD-CENTRE = PERFECT', W / 2, H - 30, '#a8c8ff', 'center', 8);
+  if (G.banner > 0) {
+    const s = SECTORS[G.sector % SECTORS.length];
+    const slide = Math.min(1, (2.4 - G.banner) * 6) * Math.min(1, G.banner * 4);
+    ctx.globalAlpha = slide;
+    panel(0, 140, W, 46, 'rgba(0,0,0,.7)', s.accent);
+    txt('SECTOR ' + (G.sector + 1), W / 2, 148, s.accent, 'center', 16);
+    txt(s.name, W / 2, 170, '#ffffff', 'center', 8);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawToasts() {
+  if (!toasts.length) return;
+  const t = toasts[0], a = Math.min(1, t.t * 6, (2.2 - t.t) * 4);
+  ctx.globalAlpha = clamp(a, 0, 1);
+  const y = state === 'play' ? 56 : 6;
+  panel(18, y, W - 36, 30, 'rgba(10,8,40,.92)', t.col);
+  txt(t.text, W / 2, y + 6, t.col, 'center', 8);
+  txt(t.sub, W / 2, y + 18, '#ffffff', 'center', 8);
+  ctx.globalAlpha = 1;
+}
+
+function missionRows(y0) {
+  save.missions.forEach((m, i) => {
+    const y = y0 + i * 20, def = MT[m.type];
+    txt(def.text(m.target), 12, y, '#ffffff', 'left', 8);
+    const f = clamp(m.prog / m.target, 0, 1);
+    ctx.fillStyle = 'rgba(255,255,255,.15)'; ctx.fillRect(12, y + 11, 150, 3);
+    ctx.fillStyle = f >= 1 ? '#6ae04a' : '#ffd84a'; ctx.fillRect(12, y + 11, Math.round(150 * f), 3);
+    ctx.drawImage(STAR_ICON, 168, y + 8);
+    txt(String(m.reward), 177, y + 8, '#ffd84a', 'left', 8);
+  });
+}
+
+function drawTitle() {
+  drawSpace(0, -clock * 25);
+  const bob = Math.round(Math.sin(clock * 2) * 3);
+  txt('ORBIT', W / 2, 26 + bob, '#ffd84a', 'center', 32, '#a0287a');
+  txt('HOP', W / 2, 62 + bob, '#ff7ac8', 'center', 32, '#3a0c6a');
+  // demo planet with orbiting hero
+  const cx = W / 2, cy = 150, ang = clock * 1.4;
+  ctx.drawImage(titlePlanet.cv, Math.round(cx - titlePlanet.half), Math.round(cy - titlePlanet.half));
+  const a = -ang;
+  ctx.save(); ctx.translate(Math.round(cx + Math.cos(a) * 40), Math.round(cy + Math.sin(a) * 40)); ctx.rotate(a + Math.PI / 2);
+  ctx.drawImage(SKINS[save.skin].spr, -5, -5); ctx.restore();
+
+  txt(`BEST ${save.best}`, 12, 202, '#ffffff', 'left', 8);
+  ctx.drawImage(STAR_ICON, W - 12 - 8 * String(save.stars).length - 10, 202);
+  txt(String(save.stars), W - 12, 202, '#ffd84a', 'right', 8);
+
+  // character select
+  const sk = SKINS[titleView], owned = save.owned.includes(titleView);
+  panel(8, 218, W - 16, 66, 'rgba(10,8,40,.75)', '#3a2a8a');
+  txt('<', 22, 238, '#ffffff', 'left', 16); txt('>', W - 22, 238, '#ffffff', 'right', 16);
+  ctx.save(); ctx.translate(W / 2 - 15, 224);
+  if (!owned) ctx.globalAlpha = 0.45;
+  ctx.drawImage(sk.spr, 0, 0, 30, 30);
+  ctx.restore(); ctx.globalAlpha = 1;
+  txt(sk.name, W / 2, 258, '#ffffff', 'center', 8);
+  if (owned) txt(titleView === save.skin ? 'EQUIPPED' : 'TAP TO EQUIP', W / 2, 270, '#6ae04a', 'center', 8);
+  else {
+    const can = save.stars >= sk.price;
+    const lbl = `${sk.price} ${can ? 'TAP TO BUY' : 'LOCKED'}`;
+    txt(lbl, W / 2 + 5, 270, can ? (Math.floor(clock * 4) % 2 ? '#ffd84a' : '#ffffff') : '#8a8aa8', 'center', 8);
+    ctx.drawImage(STAR_ICON, Math.round(W / 2 + 5 - lbl.length * 4 - 10), 270);
+  }
+
+  txt('MISSIONS', 12, 292, '#7fd6ff', 'left', 8);
+  missionRows(304);
+  if (Math.floor(clock * 2.5) % 2) txt('TAP TO PLAY', W / 2, 364, '#ffffff', 'center', 16, '#3a0c6a');
+  drawSpeaker(194, 8);
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.fillRect(0, 0, W, H);
+  txt('PAUSED', W / 2, 140, '#ffffff', 'center', 16);
+  if (Math.floor(clock * 2.5) % 2) txt('TAP TO RESUME', W / 2, 176, '#ffd84a', 'center', 8);
+  drawSpeaker(194, 8);
+}
+
+function drawOver() {
+  ctx.fillStyle = 'rgba(3,3,16,.72)'; ctx.fillRect(0, 0, W, H);
+  const t = Math.min(1, G.overT * 4);
+  txt(G.deathReason, W / 2, 40, '#ff6a6a', 'center', 8);
+  txt('GAME OVER', W / 2, 54 - (1 - t) * 20, '#ffffff', 'center', 16);
+  txt(String(G.score), W / 2, 86, G.newBest ? '#ffd84a' : '#ffffff', 'center', 32, '#3a0c6a');
+  if (G.newBest) { if (Math.floor(clock * 6) % 2) txt('NEW BEST!', W / 2, 124, '#ff7ac8', 'center', 8); }
+  else txt(`BEST ${save.best}`, W / 2, 124, '#a8c8ff', 'center', 8);
+  txt(`PERFECTS ${G.perfects}   STREAK ${G.bestStreak}`, W / 2, 140, '#ffffff', 'center', 8);
+  ctx.drawImage(STAR_ICON, W / 2 - 40, 154);
+  txt(`+${G.starsRun}  (${save.stars})`, W / 2 - 30, 154, '#ffd84a', 'left', 8);
+
+  panel(6, 172, W - 12, 78, 'rgba(10,8,40,.85)', '#3a2a8a');
+  txt('MISSIONS', 12, 178, '#7fd6ff', 'left', 8);
+  missionRows(190);
+
+  const next = SKINS.findIndex((s, i) => !save.owned.includes(i) && save.stars >= s.price);
+  if (next >= 0) txt(`${SKINS[next].name} CAN BE UNLOCKED!`, W / 2, 262, '#6ae04a', 'center', 8);
+  else {
+    const goal = SKINS.find((s, i) => !save.owned.includes(i));
+    if (goal) txt(`${goal.price - save.stars} STARS TO ${goal.name}`, W / 2, 262, '#a8c8ff', 'center', 8);
+  }
+  if (G.overT > 0.6 && Math.floor(clock * 2.5) % 2) txt('TAP TO RETRY', W / 2, 300, '#ffffff', 'center', 16, '#3a0c6a');
+  panel(W / 2 - 40, 340, 80, 24, 'rgba(10,8,40,.9)', '#ffffff');
+  txt('MENU', W / 2, 348, '#ffffff', 'center', 8);
+}
+
+let lastBg = -1;
+function draw() {
+  const sector = state === 'title' || !G ? 0 : G.sector;
+  const si = sector % SECTORS.length;
+  if (si !== lastBg) { lastBg = si; wrap.style.backgroundColor = SECTORS[si].top; }
+  if (state === 'title') { drawTitle(); drawToasts(); return; }
+  ctx.save();
+  if (G.shake > 0) ctx.translate(randInt(5) - 2, randInt(5) - 2);
+  drawSpace(G.sector, G.camY);
+  drawWorld();
+  ctx.restore();
+  if (state === 'play' || state === 'dying' || state === 'paused') drawHUD();
+  if (state === 'paused') drawPause();
+  if (state === 'over') drawOver();
+  if (G.flash > 0) { ctx.globalAlpha = Math.min(0.6, G.flash * 4); ctx.fillStyle = G.flashC; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+  drawToasts();
+}
+
+/* ---------------------------------------------------------------------
+   15. INPUT — one tap does everything
+   --------------------------------------------------------------------- */
+function cycleSkin(d) {
+  titleView = (titleView + d + SKINS.length) % SKINS.length;
+  if (save.owned.includes(titleView)) { save.skin = titleView; persist(); }
+  SFX.blip();
+}
+function buyOrEquip() {
+  const sk = SKINS[titleView];
+  if (save.owned.includes(titleView)) { save.skin = titleView; persist(); SFX.blip(); return true; }
+  if (save.stars >= sk.price) {
+    save.stars -= sk.price; save.owned.push(titleView); save.skin = titleView; persist();
+    SFX.buy(); toast('UNLOCKED!', sk.name, '#6ae04a');
+    return true;
+  }
+  SFX.nope(); return false;
+}
+function pauseGame()  { if (state === 'play') state = 'paused'; }
+function resumeGame() { if (state === 'paused') state = 'play'; }
+
+function tap(x, y) {
+  Audio8.init();
+  const corner = x > 186 && y < 28;
+  switch (state) {
+    case 'title':
+      if (corner) { Audio8.toggle(); return; }
+      if (y > 218 && y < 284) {
+        if (x < 60) return cycleSkin(-1);
+        if (x > W - 60) return cycleSkin(1);
+        if (!save.owned.includes(titleView) || titleView !== save.skin) { buyOrEquip(); return; }
+      }
+      startRun(); return;
+    case 'play':
+      if (corner) { pauseGame(); return; }
+      launch(); return;
+    case 'paused':
+      if (corner) { Audio8.toggle(); return; }
+      resumeGame(); return;
+    case 'over':
+      if (x > W / 2 - 40 && x < W / 2 + 40 && y > 336 && y < 368) { titleView = save.skin; state = 'title'; SFX.blip(); return; }
+      if (G.overT > 0.6) startRun();
+      return;
+  }
+}
+addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const r = cvs.getBoundingClientRect();
+  tap((e.clientX - r.left) / r.width * W, (e.clientY - r.top) / r.height * H);
+}, { passive: false });
+addEventListener('keydown', e => {
+  const k = e.key;
+  if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(k)) e.preventDefault();
+  if (e.repeat) return;
+  Audio8.init();
+  if (k === 'm' || k === 'M') return Audio8.toggle();
+  if (k === 'p' || k === 'P' || k === 'Escape') return state === 'play' ? pauseGame() : resumeGame();
+  if (state === 'title' && (k === 'ArrowLeft' || k === 'a')) return cycleSkin(-1);
+  if (state === 'title' && (k === 'ArrowRight' || k === 'd')) return cycleSkin(1);
+  if (state === 'title' && k === 'b') return buyOrEquip();
+  if (k === ' ' || k === 'Enter' || k === 'ArrowUp' || k === 'w' || k === 'W') {
+    if (state === 'title') startRun();
+    else if (state === 'play') launch();
+    else if (state === 'paused') resumeGame();
+    else if (state === 'over' && G.overT > 0.6) startRun();
+  }
+});
+addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('visibilitychange', () => { if (document.hidden) pauseGame(); });
+addEventListener('blur', pauseGame);
+
+/* ---------------------------------------------------------------------
+   16. MAIN LOOP — rAF + fixed 60 Hz timestep (same speed on any display)
+   --------------------------------------------------------------------- */
+let last = performance.now(), acc = 0;
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.25) dt = 0.25;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  draw();
+  requestAnimationFrame(frame);
+}
+bgCanvas(0); nebCanvas(0);
+(document.fonts && document.fonts.load ? document.fonts.load('8px "Press Start 2P"') : Promise.resolve())
+  .catch(() => {}).finally(() => requestAnimationFrame(t => { last = t; frame(t); }));
+</script>
+</body>
+</html>
